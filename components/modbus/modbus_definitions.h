@@ -1,88 +1,126 @@
 #pragma once
 
 #include "esphome/core/component.h"
+#include "esphome/components/uart/uart.h"
+
+#include "esphome/components/modbus/modbus_definitions.h"
+
+#include <cstring>
+#include <memory>
+#include <vector>
+#include <queue>
 
 namespace esphome {
 namespace modbus {
 
-/// Modbus definitions from specs:
-/// https://modbus.org/docs/Modbus_Application_Protocol_V1_1b3.pdf
-// 5 Function Code Categories
-const uint8_t FUNCTION_CODE_USER_DEFINED_SPACE_1_INIT = 65;  // 0x41
-const uint8_t FUNCTION_CODE_USER_DEFINED_SPACE_1_END = 72;   // 0x48
+static constexpr uint16_t MODBUS_TX_BUFFER_SIZE = 15;
 
-const uint8_t FUNCTION_CODE_USER_DEFINED_SPACE_2_INIT = 100;  // 0x64
-const uint8_t FUNCTION_CODE_USER_DEFINED_SPACE_2_END = 110;   // 0x6E
-
-enum class ModbusFunctionCode : uint8_t {
-  CUSTOM = 0x00,
-  READ_COILS = 0x01,
-  READ_DISCRETE_INPUTS = 0x02,
-  READ_HOLDING_REGISTERS = 0x03,
-  READ_INPUT_REGISTERS = 0x04,
-  WRITE_SINGLE_COIL = 0x05,
-  WRITE_SINGLE_REGISTER = 0x06,
-  READ_EXCEPTION_STATUS = 0x07,   // not implemented
-  DIAGNOSTICS = 0x08,             // not implemented
-  GET_COMM_EVENT_COUNTER = 0x0B,  // not implemented
-  GET_COMM_EVENT_LOG = 0x0C,      // not implemented
-  WRITE_MULTIPLE_COILS = 0x0F,
-  WRITE_MULTIPLE_REGISTERS = 0x10,
-  REPORT_SERVER_ID = 0x11,               // not implemented
-  READ_FILE_RECORD = 0x14,               // not implemented
-  WRITE_FILE_RECORD = 0x15,              // not implemented
-  MASK_WRITE_REGISTER = 0x16,            // not implemented
-  READ_WRITE_MULTIPLE_REGISTERS = 0x17,  // not implemented
-  READ_FIFO_QUEUE = 0x18,                // not implemented
+enum ModbusRole {
+  CLIENT,
+  SERVER,
 };
 
-/*Allow  comparison operators between ModbusFunctionCode and uint8_t*/
-inline bool operator==(ModbusFunctionCode lhs, uint8_t rhs) { return static_cast<uint8_t>(lhs) == rhs; }
-inline bool operator==(uint8_t lhs, ModbusFunctionCode rhs) { return lhs == static_cast<uint8_t>(rhs); }
-inline bool operator!=(ModbusFunctionCode lhs, uint8_t rhs) { return !(static_cast<uint8_t>(lhs) == rhs); }
-inline bool operator!=(uint8_t lhs, ModbusFunctionCode rhs) { return !(lhs == static_cast<uint8_t>(rhs)); }
-inline bool operator<(ModbusFunctionCode lhs, uint8_t rhs) { return static_cast<uint8_t>(lhs) < rhs; }
-inline bool operator<(uint8_t lhs, ModbusFunctionCode rhs) { return lhs < static_cast<uint8_t>(rhs); }
-inline bool operator<=(ModbusFunctionCode lhs, uint8_t rhs) { return static_cast<uint8_t>(lhs) <= rhs; }
-inline bool operator<=(uint8_t lhs, ModbusFunctionCode rhs) { return lhs <= static_cast<uint8_t>(rhs); }
-inline bool operator>(ModbusFunctionCode lhs, uint8_t rhs) { return static_cast<uint8_t>(lhs) > rhs; }
-inline bool operator>(uint8_t lhs, ModbusFunctionCode rhs) { return lhs > static_cast<uint8_t>(rhs); }
-inline bool operator>=(ModbusFunctionCode lhs, uint8_t rhs) { return static_cast<uint8_t>(lhs) >= rhs; }
-inline bool operator>=(uint8_t lhs, ModbusFunctionCode rhs) { return lhs >= static_cast<uint8_t>(rhs); }
+class ModbusDevice;
 
-// 4.3 MODBUS Data model
-enum class ModbusRegisterType : uint8_t {
-  CUSTOM = 0x00,
-  COIL = 0x01,
-  DISCRETE_INPUT = 0x02,
-  HOLDING = 0x03,
-  READ = 0x04,
+struct ModbusDeviceCommand {
+  // Frame with exact-size allocation to avoid std::vector overhead
+  std::unique_ptr<uint8_t[]> data;
+  uint16_t size;  // Modbus RTU max is 256 bytes
+
+  ModbusDeviceCommand(const uint8_t *src, uint16_t len) : data(std::make_unique<uint8_t[]>(len + 2)), size(len + 2) {
+    std::memcpy(this->data.get(), src, len);
+    auto crc = crc16(data.get(), len);
+    data[len + 0] = crc >> 0;
+    data[len + 1] = crc >> 8;
+  }
 };
 
-// 7 MODBUS Exception Responses:
-const uint8_t FUNCTION_CODE_MASK = 0x7F;
-const uint8_t FUNCTION_CODE_EXCEPTION_MASK = 0x80;
+class Modbus : public uart::UARTDevice, public Component {
+ public:
+  Modbus() = default;
 
-enum class ModbusExceptionCode : uint8_t {
-  ILLEGAL_FUNCTION = 0x01,
-  ILLEGAL_DATA_ADDRESS = 0x02,
-  ILLEGAL_DATA_VALUE = 0x03,
-  SERVICE_DEVICE_FAILURE = 0x04,
-  ACKNOWLEDGE = 0x05,
-  SERVER_DEVICE_BUSY = 0x06,
-  MEMORY_PARITY_ERROR = 0x08,
-  GATEWAY_PATH_UNAVAILABLE = 0x0A,
-  GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND = 0x0B,
+  void setup() override;
+
+  void loop() override;
+
+  void dump_config() override;
+
+  void register_device(ModbusDevice *device) { this->devices_.push_back(device); }
+
+  float get_setup_priority() const override;
+  bool tx_buffer_empty();
+  bool tx_blocked();
+
+  void send(uint8_t address, uint8_t function_code, uint16_t start_address, uint16_t number_of_entities,
+            uint8_t payload_len = 0, const uint8_t *payload = nullptr);
+  void send_raw(const std::vector<uint8_t> &payload);
+  void set_role(ModbusRole role) { this->role = role; }
+  void set_flow_control_pin(GPIOPin *flow_control_pin) { this->flow_control_pin_ = flow_control_pin; }
+  void set_send_wait_time(uint16_t time_in_ms) { this->send_wait_time_ = time_in_ms; }
+  void set_turnaround_time(uint16_t time_in_ms) { this->turnaround_delay_ms_ = time_in_ms; }
+  void set_disable_crc(bool disable_crc) { this->disable_crc_ = disable_crc; }
+
+  ModbusRole role;
+
+ protected:
+  bool parse_modbus_byte_(uint8_t byte);
+  void receive_and_parse_modbus_bytes_();
+  void clear_rx_buffer_(const LogString *reason, bool warn = false);
+  void send_next_frame_();
+  void queue_raw_(const uint8_t *data, uint16_t len);
+
+  uint32_t last_modbus_byte_{0};
+  uint32_t last_send_{0};
+  uint32_t last_send_tx_offset_{0};
+  uint16_t frame_delay_ms_{5};
+  uint16_t long_rx_buffer_delay_ms_{0};
+  uint16_t send_wait_time_{250};
+  uint16_t turnaround_delay_ms_{100};
+  uint8_t waiting_for_response_{0};
+  bool disable_crc_{false};
+
+  GPIOPin *flow_control_pin_{nullptr};
+
+  std::vector<uint8_t> rx_buffer_;
+  std::vector<ModbusDevice *> devices_;
+  // std::deque is appropriate here since we need a FIFO buffer, and we can't know ahead of time how many
+  // requests will be queued. Each modbus component may queue multiple requests, and the sequence of scheduling
+  // may change at run time.
+  std::deque<ModbusDeviceCommand> tx_buffer_;
 };
 
-// 6.12 16 (0x10) Write Multiple registers:
-const uint8_t MAX_NUM_OF_REGISTERS_TO_WRITE = 123;  // 0x7B
+class ModbusDevice {
+ public:
+  void set_parent(Modbus *parent) { parent_ = parent; }
+  void set_address(uint8_t address) { address_ = address; }
+  virtual void on_modbus_data(const std::vector<uint8_t> &data) = 0;
+  virtual void on_modbus_error(uint8_t function_code, uint8_t exception_code) {}
+  virtual void on_modbus_read_registers(uint8_t function_code, uint16_t start_address, uint16_t number_of_registers){};
+  virtual void on_modbus_write_registers(uint8_t function_code, const std::vector<uint8_t> &data){};
+  void send(uint8_t function, uint16_t start_address, uint16_t number_of_entities, uint8_t payload_len = 0,
+            const uint8_t *payload = nullptr) {
+    this->parent_->send(this->address_, function, start_address, number_of_entities, payload_len, payload);
+  }
+  void send_raw(const std::vector<uint8_t> &payload) { this->parent_->send_raw(payload); }
+  void send_error(uint8_t function_code, ModbusExceptionCode exception_code) {
+    std::vector<uint8_t> error_response;
+    error_response.reserve(3);
+    error_response.push_back(this->address_);
+    error_response.push_back(function_code | FUNCTION_CODE_EXCEPTION_MASK);
+    error_response.push_back(static_cast<uint8_t>(exception_code));
+    this->send_raw(error_response);
+  }
+  // If more than one device is connected block sending a new command before a response is received
+  ESPDEPRECATED("Use ready_for_immediate_send() instead. Removed in 2026.9.0", "2026.3.0")
+  bool waiting_for_response() { return !ready_for_immediate_send(); }
+  bool ready_for_immediate_send() { return parent_->tx_buffer_empty() && !parent_->tx_blocked(); }
 
-// 6.3 03 (0x03) Read Holding Registers
-// 6.4 04 (0x04) Read Input Registers
-const uint8_t MAX_NUM_OF_REGISTERS_TO_READ = 125;  // 0x7D
+ protected:
+  friend Modbus;
 
-static constexpr uint16_t MAX_FRAME_SIZE = 256;
-/// End of Modbus definitions
+  Modbus *parent_;
+  uint8_t address_;
+};
+
 }  // namespace modbus
 }  // namespace esphome
