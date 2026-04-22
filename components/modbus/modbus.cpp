@@ -275,7 +275,7 @@ bool Modbus::parse_modbus_byte_(uint8_t byte) {
 
   this->clear_rx_buffer_(LOG_STR("parse succeeded"));
 
-  if (this->waiting_for_response_ == address)
+  //if (this->waiting_for_response_ == address)
     this->waiting_for_response_ = 0;
 
   return true;
